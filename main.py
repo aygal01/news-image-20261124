@@ -1,74 +1,147 @@
 #!/usr/bin/env python3
-"""make.fun entrypoint: deliver the finished news image to the output dir.
+"""Entrypoint for the news-image-20261124 make.fun entry.
 
-The repository ships the completed front page as entry.png (composited by
-build_image.py from the panel art in assets/). This program copies that
-file to entry.png inside the output directory named by MAKEFUN_OUTPUT_DIR
-(the grader's convention), falling back to ENTRY_OUTPUT, then /output.
-It verifies the copy before reporting success, so two runs with no
-network and no clock dependence produce byte-identical output.
+Copies the built front page (``entry.png``, shipped next to this file)
+into the output directory and verifies the copy byte for byte.
+
+The grader runs this as ``python3 -P -s main.py`` with no network on a
+read-only repository: the only writable place is the output directory,
+given by the ``MAKEFUN_OUTPUT_DIR`` environment variable (or
+``--output-dir``). The output is deterministic: the same input always
+produces the same bytes, because this script copies a fixed file and
+writes nothing else.
 """
 
+import argparse
 import hashlib
+import json
 import os
-import shutil
+import struct
 import sys
 from pathlib import Path
 
-SOURCE = Path(__file__).resolve().parent / "entry.png"
-MAX_BYTES = 1_048_576  # 1 MiB cap for the delivered image
-JPEG_MAGIC = b"\xff\xd8"
+SOURCE_NAME = "entry.png"
+EXPECTED_WIDTH = 1024
+EXPECTED_HEIGHT = 1024
+MAX_BYTES = 1 << 20  # 1 MiB cap, matching the bounty rules
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
-def digest(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Copy entry.png into the output directory.")
+    parser.add_argument(
+        "--output-dir", default=None,
+        help="Output directory (default: $MAKEFUN_OUTPUT_DIR or ./output)")
+    parser.add_argument(
+        "--verify-only", action="store_true",
+        help="Only check the shipped entry.png; write nothing")
+    return parser.parse_args(argv)
 
 
-def looks_like_image(data: bytes) -> bool:
-    return data.startswith(JPEG_MAGIC) or data.startswith(PNG_MAGIC)
+def resolve_output_dir(args):
+    if args.output_dir:
+        return Path(args.output_dir)
+    env = os.environ.get("MAKEFUN_OUTPUT_DIR")
+    if env:
+        return Path(env)
+    return Path("output")
 
 
-def output_path() -> Path:
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR")
-    if out_dir:
-        return Path(out_dir) / "entry.png"
-    single = os.environ.get("ENTRY_OUTPUT")
-    if single:
-        return Path(single)
-    return Path("/output/entry.png")
+def png_dimensions(data):
+    """Read (width, height) from a PNG's IHDR chunk, stdlib only.
+
+    No image library is needed: the first 8 bytes are the magic, then
+    a 4-byte length, the 4-byte chunk type "IHDR", then width and
+    height as big-endian 32-bit integers.
+    """
+    if len(data) < 29 or data[12:16] != b"IHDR":
+        raise ValueError("missing IHDR chunk")
+    width, height = struct.unpack(">II", data[16:24])
+    return width, height
 
 
-def main() -> int:
-    if not SOURCE.is_file():
-        print(f"error: source image missing: {SOURCE}", file=sys.stderr)
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 16), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    here = Path(__file__).resolve().parent
+    source = here / SOURCE_NAME
+    out_dir = resolve_output_dir(args)
+    target = out_dir / SOURCE_NAME
+
+    if not source.is_file():
+        print(f"error: source image not found: {source}", file=sys.stderr)
         return 1
-
-    src = SOURCE.read_bytes()
-    if len(src) > MAX_BYTES:
-        print(f"error: source is {len(src)} bytes, over the 1 MiB cap",
+    if not args.verify_only:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if target.resolve() == source.resolve():
+            print("error: output directory is the repository itself; "
+                  "refusing to copy the file onto itself", file=sys.stderr)
+            return 1
+    data = source.read_bytes()
+    if len(data) > MAX_BYTES:
+        print(f"error: {SOURCE_NAME} is {len(data)} bytes, over the "
+              f"{MAX_BYTES} byte cap", file=sys.stderr)
+        return 1
+    if not data.startswith(PNG_MAGIC):
+        print(f"error: {SOURCE_NAME} is not a PNG file", file=sys.stderr)
+        return 1
+    try:
+        width, height = png_dimensions(data)
+    except ValueError as exc:
+        print(f"error: {SOURCE_NAME} is not a readable PNG: {exc}",
               file=sys.stderr)
         return 1
-    if not looks_like_image(src):
-        print("error: source is neither JPEG nor PNG", file=sys.stderr)
+    if (width, height) != (EXPECTED_WIDTH, EXPECTED_HEIGHT):
+        print(f"error: {SOURCE_NAME} is {width}x{height}, expected "
+              f"{EXPECTED_WIDTH}x{EXPECTED_HEIGHT}", file=sys.stderr)
         return 1
 
-    dest = output_path()
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(SOURCE, dest)
+    source_hash = hashlib.sha256(data).hexdigest()
+    if args.verify_only:
+        print(json.dumps({
+            "file": SOURCE_NAME,
+            "bytes": len(data),
+            "width": width,
+            "height": height,
+            "sha256": source_hash,
+            "status": "ok",
+        }))
+        return 0
 
-    written = dest.read_bytes()
-    if digest(written) != digest(src):
-        print("error: written file hash does not match source",
+    # Write atomically: a reader never sees a half-written file, and
+    # fsync makes the copy durable before we report success.
+    tmp = target.with_suffix(".tmp")
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, target)
+
+    copy_hash = sha256_file(target)
+    if copy_hash != source_hash:
+        print("error: copy failed verification (sha256 mismatch)",
               file=sys.stderr)
         return 1
-    if len(written) > MAX_BYTES or not looks_like_image(written):
-        print("error: written file failed verification", file=sys.stderr)
-        return 1
 
-    print(f"wrote {dest} ({len(written)} bytes, sha256 {digest(written)})")
+    print(json.dumps({
+        "file": SOURCE_NAME,
+        "bytes": len(data),
+        "width": width,
+        "height": height,
+        "sha256": source_hash,
+        "output": str(target),
+        "status": "ok",
+    }))
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
